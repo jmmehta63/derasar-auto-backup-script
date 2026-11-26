@@ -1,12 +1,12 @@
-name: MongoDB Backup
+name: MongoDB Backup (JSON per collection)
 
 on:
   schedule:
-    - cron: "0 20 * * *"      # daily at 20:00 UTC (= 01:30 AM IST). Edit as needed.
-  workflow_dispatch:           # allows manual "Run workflow" button
+    - cron: "0 20 * * *"      # daily at 20:00 UTC. Edit as needed.
+  workflow_dispatch:           # manual "Run workflow" button
 
 permissions:
-  contents: write              # needed to push the backup commit
+  contents: write
 
 concurrency:
   group: mongo-backup
@@ -21,39 +21,60 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install MongoDB Database Tools
+      - name: Install MongoDB Database Tools (mongoexport) and mongosh
         run: |
           wget -q https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.10.0.deb
           sudo apt-get install -y ./mongodb-database-tools-ubuntu2204-x86_64-100.10.0.deb
-          mongodump --version
+          sudo npm install -g mongosh
+          mongoexport --version
+          mongosh --version
 
-      - name: Dump MongoDB into a new timestamped directory
+      - name: Export every collection to its own JSON file
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
         run: |
           set -euo pipefail
-          TS="$(date -u +%Y-%m-%d_%H-%M-%S)"
-          DEST="backups/$TS"
-          FILE="mongo_${TS}.archive.gz"
-          MAX_MB=90   # GitHub rejects files > 100 MB
 
-          mkdir -p "$DEST"
-          mongodump --uri="$MONGODB_URI" --archive="/tmp/$FILE" --gzip --quiet
-
-          SIZE_MB=$(( $(stat -c%s "/tmp/$FILE") / 1024 / 1024 ))
-          echo "Backup size: ${SIZE_MB} MB"
-
-          if (( SIZE_MB > MAX_MB )); then
-            split -b "${MAX_MB}M" -d "/tmp/$FILE" "$DEST/$FILE.part_"
-            cat > "$DEST/RESTORE.txt" <<EOF
-          Split because of GitHub's file size limit. To restore:
-            cat $FILE.part_* > $FILE
-            mongorestore --uri="<your-uri>" --archive=$FILE --gzip
-          EOF
-          else
-            mv "/tmp/$FILE" "$DEST/"
+          # Database name = path part of the URI
+          DB="$(echo "$MONGODB_URI" | sed -E 's#^mongodb(\+srv)?://[^/]+/([^?]*).*#\2#')"
+          if [[ -z "$DB" || "$DB" == "$MONGODB_URI" ]]; then
+            echo "ERROR: MONGODB_URI must include the database name, e.g. .../jain-derasar-mandvi-uat"
+            exit 1
           fi
 
+          TS="$(date -u +%Y-%m-%d_%H-%M-%S)"
+          DEST="backups/$TS"
+          MAX_BYTES=$((90 * 1024 * 1024))   # GitHub rejects files > 100 MB
+          mkdir -p "$DEST"
+
+          # List collections (skip system.*)
+          COLLECTIONS="$(mongosh "$MONGODB_URI" --quiet --eval 'db.getCollectionNames().filter(n => !n.startsWith("system.")).join("\n")')"
+          echo "Collections found:"
+          echo "$COLLECTIONS"
+
+          # Export each collection: <db>.<collection>.json
+          while IFS= read -r COL; do
+            [[ -z "$COL" ]] && continue
+            echo "Exporting $COL ..."
+            mongoexport --uri="$MONGODB_URI" --collection="$COL" \
+              --jsonArray --quiet --out="$DEST/$DB.$COL.json"
+          done <<< "$COLLECTIONS"
+
+          # Handle files too big for GitHub: gzip, then split if still too big
+          for f in "$DEST"/*.json; do
+            if (( $(stat -c%s "$f") > MAX_BYTES )); then
+              echo "$f is too large; compressing..."
+              gzip -9 "$f"
+              if (( $(stat -c%s "$f.gz") > MAX_BYTES )); then
+                split -b 90M -d "$f.gz" "$f.gz.part_"
+                rm "$f.gz"
+                echo "Rejoin with: cat $(basename "$f").gz.part_* > $(basename "$f").gz && gunzip $(basename "$f").gz" \
+                  >> "$DEST/RESTORE.txt"
+              fi
+            fi
+          done
+
+          ls -lh "$DEST"
           echo "BACKUP_DIR=$DEST" >> "$GITHUB_ENV"
 
       - name: Commit and push backup
