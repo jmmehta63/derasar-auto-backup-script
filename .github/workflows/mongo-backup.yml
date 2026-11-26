@@ -1,0 +1,65 @@
+name: MongoDB Backup
+
+on:
+  schedule:
+    - cron: "0 20 * * *"      # daily at 20:00 UTC (= 01:30 AM IST). Edit as needed.
+  workflow_dispatch:           # allows manual "Run workflow" button
+
+permissions:
+  contents: write              # needed to push the backup commit
+
+concurrency:
+  group: mongo-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install MongoDB Database Tools
+        run: |
+          wget -q https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.10.0.deb
+          sudo apt-get install -y ./mongodb-database-tools-ubuntu2204-x86_64-100.10.0.deb
+          mongodump --version
+
+      - name: Dump MongoDB into a new timestamped directory
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: |
+          set -euo pipefail
+          TS="$(date -u +%Y-%m-%d_%H-%M-%S)"
+          DEST="backups/$TS"
+          FILE="mongo_${TS}.archive.gz"
+          MAX_MB=90   # GitHub rejects files > 100 MB
+
+          mkdir -p "$DEST"
+          mongodump --uri="$MONGODB_URI" --archive="/tmp/$FILE" --gzip --quiet
+
+          SIZE_MB=$(( $(stat -c%s "/tmp/$FILE") / 1024 / 1024 ))
+          echo "Backup size: ${SIZE_MB} MB"
+
+          if (( SIZE_MB > MAX_MB )); then
+            split -b "${MAX_MB}M" -d "/tmp/$FILE" "$DEST/$FILE.part_"
+            cat > "$DEST/RESTORE.txt" <<EOF
+          Split because of GitHub's file size limit. To restore:
+            cat $FILE.part_* > $FILE
+            mongorestore --uri="<your-uri>" --archive=$FILE --gzip
+          EOF
+          else
+            mv "/tmp/$FILE" "$DEST/"
+          fi
+
+          echo "BACKUP_DIR=$DEST" >> "$GITHUB_ENV"
+
+      - name: Commit and push backup
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$BACKUP_DIR"
+          git commit -m "MongoDB backup $(basename "$BACKUP_DIR")"
+          git push
